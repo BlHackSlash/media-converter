@@ -3,6 +3,8 @@
 An automated containerized pipeline designed to intelligently convert your entire image and video library into modern, space-efficient formats (HEIC, AVIF, HEVC, AV1) while preserving critical metadata and ensuring file integrity. The process leverages GPU hardware acceleration for maximum performance and includes a robust verification step.
 
 This solution is perfect for optimizing large media archives without losing history or quality. The pipeline recursively scans your input directory, processes media files into a mirrored directory structure, and automatically deletes any corrupted or metadata-mismatched files from the output.
+####
+**Images on Docker Hub**: <https://hub.docker.com/r/blhackslash/media-converter>
 
 #### **Key Features**
 

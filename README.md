@@ -1,2 +1,76 @@
-# media-converter
-An automated media conversion pipeline with GPU hardware acceleration support.
+### **Media Processing Pipeline: Convert & Verify**
+
+An automated containerized pipeline designed to intelligently convert your entire image and video library into modern, space-efficient formats (HEIC, AVIF, HEVC, AV1) while preserving critical metadata and ensuring file integrity. The process leverages GPU hardware acceleration for maximum performance and includes a robust verification step.
+
+This solution is perfect for optimizing large media archives without losing history or quality. The pipeline recursively scans your input directory, processes media files into a mirrored directory structure, and automatically deletes any corrupted or metadata-mismatched files from the output.
+
+#### **Key Features**
+
+* **Intelligent Conversion:** Converts diverse media formats to efficient alternatives.
+    * **Video:** Converts to HEVC (`x265`) or AV1 within an MP4 container.
+    * **Images:** Converts to HEIC or AVIF.
+* **Recursive Processing:** Scans nested folders in the input and replicates the structure in the output.
+* **Hardware Acceleration (GPU):** Full support for VAAPI-based hardware acceleration on both Intel and AMD GPUs for video encoding.
+* **Metadata Preservation:** Uses `exiftool` to copy critical metadata (like Creation Date, GPS coordinates) from source to converted file. It also intelligently resets image orientation to prevent double-rotation issues.
+* **Automated Verification:** A post-processing script runs integrity checks on all generated files.
+    * **Structural Check:** Uses `ffprobe` to ensure files are not corrupt.
+    * **Metadata Mismatch Check:** Verifies key metadata tags match the source file.
+    * **Auto-Deletion:** Corrupted or invalid files are immediately deleted from the output to maintain archive quality.
+* **Smart "Revert" Logic:** If a converted image is larger than its original counterpart, the pipeline deletes the larger file and just copies the original, unless the original was already in a modern format.
+
+---
+
+### **Supported Tags**
+
+Choose the image tag that matches your hardware for optimal performance.
+
+| Tag | Description | Use Case |
+| :--- | :--- | :--- |
+| **`latest`** | Default image. Supports hardware acceleration on **both Intel and AMD** GPUs. | General purpose. Recommended for mixed environments or if unsure. |
+| **`intel`** | Optimized specifically for **Intel** QuickSync Video (VAAPI) hardware acceleration. | Use on machines with an Intel CPU with integrated graphics or an Intel discrete GPU. |
+| **`amd`** | Optimized specifically for **AMD** Radeon (VAAPI) hardware acceleration. | Use on machines with an AMD CPU with integrated graphics or an AMD discrete GPU. |
+
+---
+
+### **Quick Start: Docker Compose**
+
+The most common way to run the pipeline is via Docker Compose. This example sets up the service to process media with hardware acceleration and standard quality settings.
+
+```yaml
+services:
+  media-pipeline:
+    image: blhackslash/media-converter:latest  # Or choose :intel, :amd
+    container_name: media-converter
+    devices:
+      - /dev/dri:/dev/dri  # Pass the GPU device for acceleration
+    volumes:
+      - /path/to/your/photos/source:/data/input  # Recursive source folder
+      - /path/to/your/processed/photos:/data/output # Recursive destination folder
+    environment:
+      - HW_ACCEL=true             # Enable hardware acceleration (default)
+      - VIDEO_CODEC=hevc           # Set default video codec (hevc or av1)
+      - VIDEO_QUALITY=28          # Integer quality level (lower is better, default 28)
+      - IMAGE_FORMAT=heic         # Set default image format (heic or avif)
+      - IMAGE_QUALITY=80          # Integer image quality (0-100, default 80)
+    # The pipeline runs once and then exits. Set a restart policy if you want it to trigger again on changes.
+    # restart: unless-stopped
+```
+
+---
+
+### **Environment Variables**
+
+You can customize the conversion process by setting the following environment variables.
+
+| Variable Name | Available Options | Default | Description |
+| :--- | :--- | :--- | :--- |
+| **`HW_ACCEL`** | `true`, `false` | `true` | Enables or disables VAAPI hardware acceleration for video encoding. Recommended to keep `true` with a supported GPU. |
+| **`RENDER_DEVICE`** | `renderD128`, `renderD129`, etc. | `renderD128` | Specifies the render node to use for hardware acceleration. Useful for multi-GPU setups. Found in `/dev/dri/`. |
+| **`VIDEO_CODEC`** | `hevc`, `av1` | `hevc` | Defines the codec used for video files. |
+| **`VIDEO_QUALITY`** | Integer (CRF-like) | `28` | Sets the target quality for video encoding. Lower values are higher quality (but larger files). Range is codec dependent, 28 is a balanced default for VAAPI. |
+| **`VIDEO_CONTAINER`** | Any valid extension, e.g., `mp4`, `mkv` | `mp4` | The file extension for all output videos. (Codecs are always set, container choice is flexible). |
+| **`IMAGE_FORMAT`** | `heic`, `avif` | `heic` | Defines the modern format for image files. |
+| **`IMAGE_QUALITY`** | Integer `0` - `100` | `80` | Sets the target quality for image encoding. 100 is lossless, 0 is worst quality. |
+| **`IMAGE_SPEED`** | Integer `0` - `9` | `4` | Controls the encoding speed for AVIF files (uses `avifenc`). 0 is slowest/best compression, 9 is fastest. `heif-enc` doesn't use this. |
+| **`INPUT_DIR`** | Any container path | `/data/input` | The volume-mounted directory inside the container containing your source files. |
+| **`OUTPUT_DIR`** | Any container path | `/data/output` | The volume-mounted directory inside the container where the processed files are stored. |

@@ -51,9 +51,9 @@ services:
     environment:
       - HW_ACCEL=true             # Enable hardware acceleration (default)
       - VIDEO_CODEC=hevc           # Set default video codec (hevc or av1)
-      - VIDEO_QUALITY=28          # Integer quality level (lower is better, default 28)
+      - VIDEO_QUALITY=32          # Integer quality level (lower is better, default 28)
       - IMAGE_FORMAT=heic         # Set default image format (heic or avif)
-      - IMAGE_QUALITY=80          # Integer image quality (0-100, default 80)
+      - IMAGE_QUALITY=60          # Integer image quality (0-100, default 80)
     # The pipeline runs once and then exits. Set a restart policy if you want it to trigger again on changes.
     # restart: unless-stopped
 ```

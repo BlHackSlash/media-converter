@@ -6,6 +6,7 @@ from pathlib import Path
 # --- Configuration ---
 INPUT_DIR = Path(os.environ.get("INPUT_DIR", "/data/input"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/output"))
+CHECKS = os.environ.get("CHECKS", "all").lower() # all, integrity, metadata, none
 
 def check_structural_integrity(file_path):
     cmd = [
@@ -21,7 +22,8 @@ def check_structural_integrity(file_path):
         return False, str(e)
 
 def get_metadata(file_path):
-    cmd = ["exiftool", "-j", "-DateTimeOriginal", "-GPSLatitude", "-GPSLongitude", str(file_path)]
+    # Added '-n' for numeric output and '-CreateDate' as a video fallback
+    cmd = ["exiftool", "-j", "-n", "-DateTimeOriginal", "-CreateDate", "-GPSLatitude", "-GPSLongitude", str(file_path)]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode == 0:
@@ -34,14 +36,34 @@ def get_metadata(file_path):
 
 def compare_metadata(meta_src, meta_dst):
     discrepancies = []
-    tags_to_check = ["DateTimeOriginal", "GPSLatitude", "GPSLongitude"]
 
-    for tag in tags_to_check:
+    # 1. Date Check (handles image vs video date tags)
+    date_src = meta_src.get("DateTimeOriginal") or meta_src.get("CreateDate")
+    date_dst = meta_dst.get("DateTimeOriginal") or meta_dst.get("CreateDate")
+
+    if date_src:
+        if not date_dst:
+            discrepancies.append("Missing Date")
+        elif str(date_src) != str(date_dst):
+            discrepancies.append("Date Mismatch")
+
+    # 2. GPS Check (Numeric float comparison with tolerance)
+    for tag in ["GPSLatitude", "GPSLongitude"]:
         val_src = meta_src.get(tag)
         val_dst = meta_dst.get(tag)
-        if val_src:
-            if not val_dst: discrepancies.append(f"Missing {tag}")
-            elif str(val_src) != str(val_dst): discrepancies.append(f"{tag} Mismatch")
+
+        if val_src is not None:
+            if val_dst is None:
+                discrepancies.append(f"Missing {tag}")
+            else:
+                try:
+                    # Compare floats with a 0.0001 degree tolerance (~11 meters)
+                    if abs(float(val_src) - float(val_dst)) > 0.0001:
+                        discrepancies.append(f"{tag} Mismatch")
+                except ValueError:
+                    # Fallback to string if float conversion fails for some reason
+                    if str(val_src) != str(val_dst):
+                        discrepancies.append(f"{tag} Mismatch")
 
     if not discrepancies: return True, ""
     return False, " | ".join(discrepancies)
@@ -57,6 +79,11 @@ def get_input_files():
 
 def main():
     print("--- Starting Integrity Check ---")
+
+    if CHECKS == "none":
+        print("Checks disabled by environment variable (CHECKS=none). Exiting gracefully.")
+        return
+
     if not OUTPUT_DIR.exists() or not INPUT_DIR.exists():
         print("[ERROR] Input or Output directory missing.")
         return
@@ -75,26 +102,33 @@ def main():
             print(f"[WARN] No matching input file found for: {out_path.name}")
             continue
 
+        file_failed = False
+
         # 1. Structural Check
-        is_struct_ok, struct_err = check_structural_integrity(out_path)
-        if not is_struct_ok:
-            print(f"[FAIL] {out_path.name} -> CORRUPT FILE: {struct_err}")
-            out_path.unlink() # AUTO-DELETE
-            print(f"       -> Deleted corrupted file.")
-            failed += 1
-            continue
+        if CHECKS in ["all", "integrity"]:
+            is_struct_ok, struct_err = check_structural_integrity(out_path)
+            if not is_struct_ok:
+                print(f"[FAIL] {out_path.name} -> CORRUPT FILE: {struct_err}")
+                out_path.unlink() # AUTO-DELETE
+                print(f"       -> Deleted corrupted file.")
+                failed += 1
+                file_failed = True
+                continue # Skip to next file
 
         # 2. Metadata Check
-        is_meta_ok, meta_err = compare_metadata(get_metadata(in_path), get_metadata(out_path))
-        if not is_meta_ok:
-            print(f"[FAIL] {out_path.name} -> METADATA ERROR: {meta_err}")
-            out_path.unlink() # AUTO-DELETE
-            print(f"       -> Deleted file due to metadata mismatch.")
-            failed += 1
-            continue
+        if not file_failed and CHECKS in ["all", "metadata"]:
+            is_meta_ok, meta_err = compare_metadata(get_metadata(in_path), get_metadata(out_path))
+            if not is_meta_ok:
+                print(f"[FAIL] {out_path.name} -> METADATA ERROR: {meta_err}")
+                out_path.unlink() # AUTO-DELETE
+                print(f"       -> Deleted file due to metadata mismatch.")
+                failed += 1
+                file_failed = True
+                continue # Skip to next file
 
-        print(f"[OK] {out_path.name} -> Structure & Metadata Verified")
-        passed += 1
+        if not file_failed:
+            print(f"[OK] {out_path.name} -> Verified")
+            passed += 1
 
     print("\n--- Integrity Check Complete ---")
     print(f"Total Verified: {passed}")

@@ -66,13 +66,17 @@ You can customize the conversion process by setting the following environment va
 
 | Variable Name | Available Options | Default | Description |
 | :--- | :--- | :--- | :--- |
-| **`HW_ACCEL`** | `true`, `false` | `true` | Enables or disables VAAPI hardware acceleration for video encoding. Recommended to keep `true` with a supported GPU. |
-| **`RENDER_DEVICE`** | `renderD128`, `renderD129`, etc. | `renderD128` | Specifies the render node to use for hardware acceleration. Useful for multi-GPU setups. Found in `/dev/dri/`. |
+| **`HW_ACCEL`** | `true`, `false` | `true` | Enables or disables VAAPI hardware acceleration for video encoding. Falls back to CPU encoders (`libx265`/`libsvtav1`) if `false`. |
+| **`RENDER_DEVICE`** | `renderD128`, `renderD129`, etc. | `renderD128` | Specifies the render node to use for hardware acceleration. Found in `/dev/dri/`. |
 | **`VIDEO_CODEC`** | `hevc`, `av1` | `hevc` | Defines the codec used for video files. |
-| **`VIDEO_QUALITY`** | Integer (CRF-like) | `28` | Sets the target quality for video encoding. Lower values are higher quality (but larger files). Range is codec dependent, 28 is a balanced default for VAAPI. |
-| **`VIDEO_CONTAINER`** | Any valid extension, e.g., `mp4`, `mkv` | `mp4` | The file extension for all output videos. (Codecs are always set, container choice is flexible). |
+| **`VIDEO_QUALITY`** | Integer (CRF/QP) | **`32`** | Sets the target quality for video encoding. Lower is higher quality. Range is codec dependent. |
+| **`VIDEO_PRESET`** | `slow`, `medium`, `fast`, `0`-`13` | *Auto* | Encoding speed/efficiency. Defaults to **`medium`** (HEVC) or **`6`** (AV1) if not specified. |
+| **`VIDEO_CONTAINER`** | `mp4`, `mkv`, etc. | `mp4` | The file extension for all output videos. |
 | **`IMAGE_FORMAT`** | `heic`, `avif` | `heic` | Defines the modern format for image files. |
-| **`IMAGE_QUALITY`** | Integer `0` - `100` | `80` | Sets the target quality for image encoding. 100 is lossless, 0 is worst quality. |
-| **`IMAGE_SPEED`** | Integer `0` - `9` | `4` | Controls the encoding speed for AVIF files (uses `avifenc`). 0 is slowest/best compression, 9 is fastest. `heif-enc` doesn't use this. |
-| **`INPUT_DIR`** | Any container path | `/data/input` | The volume-mounted directory inside the container containing your source files. |
-| **`OUTPUT_DIR`** | Any container path | `/data/output` | The volume-mounted directory inside the container where the processed files are stored. |
+| **`IMAGE_QUALITY`** | Integer `0` - `100` | **`60`** | Sets the target quality for image encoding. |
+| **`IMAGE_SPEED`** | Integer `0` - `9` | `4` | Controls the encoding speed for AVIF files (`avifenc`). |
+| **`CHECKS`** | `all`, `integrity`, `metadata`, `none` | `all` | Controls which validation steps run after conversion. |
+| **`FORCE_OVERWRITE`** | `true`, `false` | `false` | If `true`, re-processes and overwrites files already present in the output directory. |
+| **`LIMIT_SIZE`** | `always`, `videos`, `images`, `never` | `always` | If the converted file is larger than the original, it reverts and keeps the original file. |
+| **`INPUT_DIR`** | Path | `/data/input` | The directory containing your source files. |
+| **`OUTPUT_DIR`** | Path | `/data/output` | The directory where processed files are stored. |

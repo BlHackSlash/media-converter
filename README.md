@@ -31,7 +31,7 @@ Choose the image tag that matches your hardware for optimal performance.
 | **`latest`** | Default image. Supports hardware acceleration on **both Intel and AMD** GPUs. | General purpose. Recommended for mixed environments or if unsure. |
 | **`intel`** | Optimized specifically for **Intel** QuickSync Video (VAAPI) hardware acceleration. | Use on machines with an Intel CPU with integrated graphics or an Intel discrete GPU. |
 | **`amd`** | Optimized specifically for **AMD** Radeon (VAAPI) hardware acceleration. | Use on machines with an AMD CPU with integrated graphics or an AMD discrete GPU. |
-
+| **`cpu`** | Minimal image without GPU drivers. | Use on machines without a supported GPU. Can be resource heavy. |
 ---
 
 ### **Quick Start: Docker Compose**

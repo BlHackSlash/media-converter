@@ -69,11 +69,11 @@ You can customize the conversion process by setting the following environment va
 | **`HW_ACCEL`** | `true`, `false` | `true` | Enables or disables VAAPI hardware acceleration for video encoding. Falls back to CPU encoders (`libx265`/`libsvtav1`) if `false`. |
 | **`RENDER_DEVICE`** | `renderD128`, `renderD129`, etc. | `renderD128` | Specifies the render node to use for hardware acceleration. Found in `/dev/dri/`. |
 | **`VIDEO_CODEC`** | `hevc`, `av1` | `hevc` | Defines the codec used for video files. |
-| **`VIDEO_QUALITY`** | Integer (CRF/QP) | **`32`** | Sets the target quality for video encoding. Lower is higher quality. Range is codec dependent. |
+| **`VIDEO_QUALITY`** | Integer (CRF/QP) | **`28`** | Sets the target quality for video encoding. Lower is higher quality. Range is codec dependent. |
 | **`VIDEO_PRESET`** | `slow`, `medium`, `fast`, `0`-`13` | *Auto* | Encoding speed/efficiency. Defaults to **`medium`** (HEVC) or **`6`** (AV1) if not specified. |
 | **`VIDEO_CONTAINER`** | `mp4`, `mkv`, etc. | `mp4` | The file extension for all output videos. |
 | **`IMAGE_FORMAT`** | `heic`, `avif` | `heic` | Defines the modern format for image files. |
-| **`IMAGE_QUALITY`** | Integer `0` - `100` | **`60`** | Sets the target quality for image encoding. |
+| **`IMAGE_QUALITY`** | Integer `0` - `100` | **`70`** | Sets the target quality for image encoding. |
 | **`IMAGE_SPEED`** | Integer `0` - `9` | `4` | Controls the encoding speed for AVIF files (`avifenc`). |
 | **`CHECKS`** | `all`, `integrity`, `metadata`, `none` | `all` | Controls which validation steps run after conversion. |
 | **`FORCE_OVERWRITE`** | `true`, `false` | `false` | If `true`, re-processes and overwrites files already present in the output directory. |

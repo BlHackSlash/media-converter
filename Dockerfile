@@ -8,10 +8,10 @@ RUN apk update && apk add --no-cache \
     libheif-tools \
     exiftool \
     # GPU Drivers
-    mesa-va-gallium \
-    intel-media-driver \
-    libva-intel-driver \
-    libva-utils \
+    #mesa-va-gallium \
+    #intel-media-driver \
+    #libva-intel-driver \
+    #libva-utils \
     bash
 
 # Ensure a virtual environment isn't strictly required for simple scripts

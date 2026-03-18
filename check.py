@@ -1,6 +1,7 @@
 import os
 import subprocess
 import json
+import re
 from pathlib import Path
 
 # --- Configuration ---
@@ -21,9 +22,34 @@ def check_structural_integrity(file_path):
     except Exception as e:
         return False, str(e)
 
+def extract_gps(meta):
+    """Helper to reliably extract Latitude and Longitude into floats from either EXIF or QuickTime."""
+    lat, lon = meta.get("GPSLatitude"), meta.get("GPSLongitude")
+
+    # If standard EXIF tags exist (mostly images), use them
+    if lat is not None and lon is not None:
+        try:
+            return float(lat), float(lon)
+        except ValueError:
+            pass
+
+    # Fallback for Apple QuickTime GPSCoordinates (Lat Lon Alt)
+    coords = meta.get("GPSCoordinates")
+    if coords:
+        # With exiftool -n, this is space-separated: e.g., "37.33 -122.03 15.4"
+        parts = str(coords).split()
+        if len(parts) >= 2:
+            try:
+                return float(parts[0]), float(parts[1])
+            except ValueError:
+                pass
+
+    return None, None
+
 def get_metadata(file_path):
-    # Added '-n' for numeric output and '-CreateDate' as a video fallback
-    cmd = ["exiftool", "-j", "-n", "-DateTimeOriginal", "-CreateDate", "-GPSLatitude", "-GPSLongitude", str(file_path)]
+    # Added '-CreationDate' to catch Apple's local time tag
+    cmd = ["exiftool", "-j", "-n", "-DateTimeOriginal", "-CreationDate", "-CreateDate",
+           "-GPSLatitude", "-GPSLongitude", "-GPSCoordinates", "-ee", str(file_path)]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode == 0:
@@ -34,36 +60,43 @@ def get_metadata(file_path):
     except Exception:
         return {}
 
+def parse_base_date(date_str):
+    """Strips timezones and extra formatting to return just YYYY:MM:DD HH:MM:SS"""
+    if not date_str: return None
+    match = re.search(r"(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})", str(date_str))
+    return match.group(1) if match else None
+
 def compare_metadata(meta_src, meta_dst):
     discrepancies = []
 
-    # 1. Date Check (handles image vs video date tags)
-    date_src = meta_src.get("DateTimeOriginal") or meta_src.get("CreateDate")
-    date_dst = meta_dst.get("DateTimeOriginal") or meta_dst.get("CreateDate")
+    # 1. Smarter Date Check
+    # Grab all possible dates and strip timezones
+    dates_src = {parse_base_date(meta_src.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]}
+    dates_dst = {parse_base_date(meta_dst.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]}
 
-    if date_src:
-        if not date_dst:
+    # Remove Nones from the sets
+    dates_src.discard(None)
+    dates_dst.discard(None)
+
+    if dates_src:
+        if not dates_dst:
             discrepancies.append("Missing Date")
-        elif str(date_src) != str(date_dst):
-            discrepancies.append("Date Mismatch")
+        # If there is NO overlap between the source dates and destination dates, it's a mismatch
+        elif not dates_src.intersection(dates_dst):
+            discrepancies.append(f"Date Mismatch (Src: {dates_src} vs Dst: {dates_dst})")
 
-    # 2. GPS Check (Numeric float comparison with tolerance)
-    for tag in ["GPSLatitude", "GPSLongitude"]:
-        val_src = meta_src.get(tag)
-        val_dst = meta_dst.get(tag)
+    # 2. GPS Check (using the helper function from the previous fix)
+    lat_src, lon_src = extract_gps(meta_src)
+    lat_dst, lon_dst = extract_gps(meta_dst)
 
-        if val_src is not None:
-            if val_dst is None:
-                discrepancies.append(f"Missing {tag}")
-            else:
-                try:
-                    # Compare floats with a 0.0001 degree tolerance (~11 meters)
-                    if abs(float(val_src) - float(val_dst)) > 0.0001:
-                        discrepancies.append(f"{tag} Mismatch")
-                except ValueError:
-                    # Fallback to string if float conversion fails for some reason
-                    if str(val_src) != str(val_dst):
-                        discrepancies.append(f"{tag} Mismatch")
+    if lat_src is not None and lon_src is not None:
+        if lat_dst is None or lon_dst is None:
+            discrepancies.append("Missing GPS Data")
+        else:
+            if abs(lat_src - lat_dst) > 0.0001:
+                discrepancies.append("Latitude Mismatch")
+            if abs(lon_src - lon_dst) > 0.0001:
+                discrepancies.append("Longitude Mismatch")
 
     if not discrepancies: return True, ""
     return False, " | ".join(discrepancies)

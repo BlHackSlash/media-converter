@@ -7,12 +7,13 @@ from pathlib import Path
 # --- Configuration ---
 INPUT_DIR = Path(os.environ.get("INPUT_DIR", "/data/input"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/output"))
-HW_ACCEL = os.environ.get("HW_ACCEL", "true").lower() == "true"
+#HW_ACCEL = os.environ.get("HW_ACCEL", "true").lower() == "true"
+HW_ACCEL = False
 RENDER_DEVICE = os.environ.get("RENDER_DEVICE", "renderD128")
 DEVICE_PATH = f"/dev/dri/{RENDER_DEVICE}"
 
 # Quality Defaults Updated
-VIDEO_QUALITY = os.environ.get("VIDEO_QUALITY", "32")
+VIDEO_QUALITY = os.environ.get("VIDEO_QUALITY", "28")
 VIDEO_CODEC = os.environ.get("VIDEO_CODEC", "hevc").lower()
 VIDEO_CONTAINER = os.environ.get("VIDEO_CONTAINER", "mp4").lstrip(".")
 VIDEO_PRESET = os.environ.get("VIDEO_PRESET")
@@ -76,6 +77,7 @@ def process_video_hevc_gpu(input_path, output_file):
         "-metadata:s:v:0", "rotate=",                 # STRIP the rotation flag to prevent double-rotation
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",                    # Optimize for web streaming
+        "-movflags", "+use_metadata_tags",
         str(output_file)
     ]
     return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -93,6 +95,7 @@ def process_video_av1_gpu(input_path, output_file):
         "-metadata:s:v:0", "rotate=",                 # STRIP the rotation flag
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
+        "-movflags", "+use_metadata_tags",
         str(output_file)
     ]
     return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -110,6 +113,7 @@ def process_video_hevc_cpu(input_path, output_file):
         "-metadata:s:v:0", "rotate=",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
+        "-movflags", "+use_metadata_tags",
         str(output_file)
     ]
     return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -127,6 +131,7 @@ def process_video_av1_cpu(input_path, output_file):
         "-metadata:s:v:0", "rotate=",
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
+        "-movflags", "+use_metadata_tags",
         str(output_file)
     ]
     return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

@@ -7,8 +7,8 @@ from pathlib import Path
 # --- Configuration ---
 INPUT_DIR = Path(os.environ.get("INPUT_DIR", "/data/input"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/output"))
-#HW_ACCEL = os.environ.get("HW_ACCEL", "true").lower() == "true"
-HW_ACCEL = False
+HW_ACCEL = os.environ.get("HW_ACCEL", "true").lower() == "true"
+#HW_ACCEL = False
 RENDER_DEVICE = os.environ.get("RENDER_DEVICE", "renderD128")
 DEVICE_PATH = f"/dev/dri/{RENDER_DEVICE}"
 
@@ -70,7 +70,6 @@ def process_video_hevc_gpu(input_path, output_file):
         "-map", "0:v:0", "-map", "0:a?",              # Map the first video stream and all audio streams (if any)
         "-map_metadata", "0",                         # Copy global metadata (Date, GPS, etc.)
         "-map_metadata:s:v", "0:s:v",                 # Copy video stream metadata
-        "-map_metadata:s:a", "0:s:a",                 # Copy audio stream metadata (Language tags, etc.)
         "-map_chapters", "0",                         # Copy chapter markers
         "-vf", "format=nv12,hwupload",                # Hardware acceleration filters
         "-c:v", "hevc_vaapi", "-qp", VIDEO_QUALITY,
@@ -88,7 +87,6 @@ def process_video_av1_gpu(input_path, output_file):
         "-map", "0:v:0", "-map", "0:a?",
         "-map_metadata", "0",
         "-map_metadata:s:v", "0:s:v",
-        "-map_metadata:s:a", "0:s:a",
         "-map_chapters", "0",
         "-vf", "format=nv12,hwupload",
         "-c:v", "av1_vaapi", "-qp", VIDEO_QUALITY,
@@ -107,7 +105,6 @@ def process_video_hevc_cpu(input_path, output_file):
         "-map", "0:v:0", "-map", "0:a?",
         "-map_metadata", "0",
         "-map_metadata:s:v", "0:s:v",
-        "-map_metadata:s:a", "0:s:a",
         "-map_chapters", "0",
         "-c:v", "libx265", "-crf", VIDEO_QUALITY, "-preset", preset,
         "-metadata:s:v:0", "rotate=",
@@ -125,7 +122,6 @@ def process_video_av1_cpu(input_path, output_file):
         "-map", "0:v:0", "-map", "0:a?",
         "-map_metadata", "0",
         "-map_metadata:s:v", "0:s:v",
-        "-map_metadata:s:a", "0:s:a",
         "-map_chapters", "0",
         "-c:v", "libsvtav1", "-crf", VIDEO_QUALITY, "-preset", preset,
         "-metadata:s:v:0", "rotate=",
@@ -221,7 +217,7 @@ def main():
                 total_orig_size += orig_size
                 total_new_size += new_size
             else:
-                err = res.stderr.decode('utf-8', errors='ignore')[-150:].replace('\n', ' ')
+                err = res.stderr.decode('utf-8', errors='ignore')[-250:].replace('\n', ' ')
                 print(f"[{count}/{len(files_to_process)}] FAIL: {input_path.name} - {err}")
 
         except Exception as e:

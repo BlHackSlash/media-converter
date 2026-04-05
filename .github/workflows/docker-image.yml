@@ -37,4 +37,4 @@ jobs:
           build-args: |
             HW_TYPE=${{ matrix.hardware }}
           # Automatically creates the :latest tag!
-          tags: ghcr.io/<your-lowercase-github-username>/media-converter:${{ matrix.hardware }}
+          tags: ghcr.io/blhackslash/media-converter:${{ matrix.hardware }}

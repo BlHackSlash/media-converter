@@ -176,7 +176,6 @@ def main():
 
             output_file = target_dir / (f"{input_path.stem}.{VIDEO_CONTAINER if ftype == 'VIDEO' else IMAGE_FORMAT}")
 
-            # Added FORCE_OVERWRITE logic here
             if not FORCE_OVERWRITE and output_file.exists() and output_file.stat().st_size > 0:
                 print(f"[{count}/{len(files_to_process)}] SKIP: {input_path.name}"); continue
 
@@ -188,10 +187,15 @@ def main():
                     res = process_video_av1_cpu(input_path, output_file) if VIDEO_CODEC == "av1" else process_video_hevc_cpu(input_path, output_file)
             else:
                 res = process_image_avif(input_path, output_file) if IMAGE_FORMAT == "avif" else process_image_heic(input_path, output_file)
+                
+                # --- The Magic EXIF Fix ---
                 if res.returncode == 0 and input_path.suffix.lower() not in [".heic", ".avif"]:
                     subprocess.run([
-                        "exiftool", "-tagsFromFile", str(input_path), "-all:all",
-                        "-Orientation=1", "-n", "-overwrite_original", str(output_file)
+                        "exiftool", "-tagsFromFile", str(input_path),
+                        "-all:all",                               # 1. Copy all standard tags (Date, GPS, etc)
+                        "-Orientation<Rotation",                  # 2. Fallback: If source had modern 'Rotation', push it to EXIF 'Orientation'
+                        "-Orientation<Orientation",               # 3. Primary: Ensure original EXIF 'Orientation' survives
+                        "-overwrite_original", str(output_file)
                     ], stdout=subprocess.DEVNULL)
 
             elapsed = time.time() - start
@@ -201,7 +205,6 @@ def main():
                 orig_size = input_path.stat().st_size
                 new_size = output_file.stat().st_size if output_file.exists() else 0
 
-                # Added LIMIT_SIZE logic here
                 should_limit = False
                 if LIMIT_SIZE == "always": should_limit = True
                 elif LIMIT_SIZE == "videos" and ftype == "VIDEO": should_limit = True

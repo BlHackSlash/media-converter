@@ -8,9 +8,11 @@ from pathlib import Path
 INPUT_DIR = Path(os.environ.get("INPUT_DIR", "/data/input"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/output"))
 HW_ACCEL = os.environ.get("HW_ACCEL", "true").lower() == "true"
-#HW_ACCEL = False
 RENDER_DEVICE = os.environ.get("RENDER_DEVICE", "renderD128")
 DEVICE_PATH = f"/dev/dri/{RENDER_DEVICE}"
+
+# Added Mode Variable
+MODE = os.environ.get("MODE", "full").lower() # convert, check, full
 
 # Quality Defaults Updated
 VIDEO_QUALITY = os.environ.get("VIDEO_QUALITY", "28")
@@ -48,12 +50,10 @@ def check_file_type(path):
     return None
 
 def copy_with_meta(input_path, output_file):
-    """Fallback for files already in the target format."""
     shutil.copy2(input_path, output_file)
     return subprocess.CompletedProcess(args=[], returncode=0)
 
 def get_compatible_image_input(input_path, temp_path):
-    """Uses ffmpeg to create a temporary PNG for picky encoders."""
     valid_native = {'.jpg', '.jpeg', '.png'}
     if input_path.suffix.lower() in valid_native:
         return input_path
@@ -63,19 +63,18 @@ def get_compatible_image_input(input_path, temp_path):
     return temp_path
 
 # --- Processing Functions ---
-
 def process_video_hevc_gpu(input_path, output_file):
     cmd = [
         "ffmpeg", "-y", "-vaapi_device", DEVICE_PATH, "-i", str(input_path),
-        "-map", "0:v:0", "-map", "0:a?",              # Map the first video stream and all audio streams (if any)
-        "-map_metadata", "0",                         # Copy global metadata (Date, GPS, etc.)
-        "-map_metadata:s:v", "0:s:v",                 # Copy video stream metadata
-        "-map_chapters", "0",                         # Copy chapter markers
-        "-vf", "format=nv12,hwupload",                # Hardware acceleration filters
+        "-map", "0:v:0", "-map", "0:a?",              
+        "-map_metadata", "0",                         
+        "-map_metadata:s:v", "0:s:v",                 
+        "-map_chapters", "0",                         
+        "-vf", "format=nv12,hwupload",                
         "-c:v", "hevc_vaapi", "-qp", VIDEO_QUALITY,
-        "-metadata:s:v:0", "rotate=",                 # STRIP the rotation flag to prevent double-rotation
+        "-metadata:s:v:0", "rotate=",                 
         "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",                    # Optimize for web streaming
+        "-movflags", "+faststart",                    
         "-movflags", "+use_metadata_tags",
         str(output_file)
     ]
@@ -90,7 +89,7 @@ def process_video_av1_gpu(input_path, output_file):
         "-map_chapters", "0",
         "-vf", "format=nv12,hwupload",
         "-c:v", "av1_vaapi", "-qp", VIDEO_QUALITY,
-        "-metadata:s:v:0", "rotate=",                 # STRIP the rotation flag
+        "-metadata:s:v:0", "rotate=",                 
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",
         "-movflags", "+use_metadata_tags",
@@ -158,6 +157,10 @@ def process_image_avif(input_path, output_file):
     return res
 
 def main():
+    if MODE == "check":
+        print("--- Media Converter Skipped (MODE=check) ---")
+        return
+
     check_dependencies()
     print(f"--- Media Converter Started ---")
     files_to_process = [Path(root) / f for root, dirs, files in os.walk(INPUT_DIR) for f in files if check_file_type(Path(root) / f)]
@@ -188,19 +191,17 @@ def main():
             else:
                 res = process_image_avif(input_path, output_file) if IMAGE_FORMAT == "avif" else process_image_heic(input_path, output_file)
                 
-                # --- The Magic EXIF Fix ---
                 if res.returncode == 0 and input_path.suffix.lower() not in [".heic", ".avif"]:
                     subprocess.run([
                         "exiftool", "-tagsFromFile", str(input_path),
-                        "-all:all",                               # 1. Copy all standard tags (Date, GPS, etc)
-                        "-Orientation<Rotation",                  # 2. Fallback: If source had modern 'Rotation', push it to EXIF 'Orientation'
-                        "-Orientation<Orientation",               # 3. Primary: Ensure original EXIF 'Orientation' survives
+                        "-all:all",                               
+                        "-Orientation<Rotation",                  
+                        "-Orientation<Orientation",               
                         "-overwrite_original", str(output_file)
                     ], stdout=subprocess.DEVNULL)
 
             elapsed = time.time() - start
 
-# --- Output Logging and Size Check ---
             if res.returncode == 0:
                 orig_size = input_path.stat().st_size
                 new_size = output_file.stat().st_size if output_file.exists() else 0

@@ -3,16 +3,24 @@ import subprocess
 import json
 import re
 from pathlib import Path
+from datetime import datetime
 
 # --- Configuration ---
 INPUT_DIR = Path(os.environ.get("INPUT_DIR", "/data/input"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/output"))
 CHECKS = os.environ.get("CHECKS", "all").lower() 
 
-# Added Mode Variable
+# Added Variables for Robustness
 MODE = os.environ.get("MODE", "full").lower() # convert, check, full
+DATE_TOLERANCE_SECONDS = int(os.environ.get("DATE_TOLERANCE_SECONDS", 86400)) # Default 24h for timezone drift
+DURATION_TOLERANCE_SECONDS = float(os.environ.get("DURATION_TOLERANCE_SECONDS", 5.0)) # 5 second leniency
 
 def check_structural_integrity(file_path):
+    # Check 1: Is the file completely empty?
+    if file_path.stat().st_size == 0:
+        return False, "File is 0 bytes."
+
+    # Check 2: FFprobe container scan
     cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)
@@ -46,8 +54,9 @@ def extract_gps(meta):
     return None, None
 
 def get_metadata(file_path):
+    # Added -Duration to track if the converted file was truncated
     cmd = ["exiftool", "-j", "-n", "-DateTimeOriginal", "-CreationDate", "-CreateDate",
-           "-GPSLatitude", "-GPSLongitude", "-GPSCoordinates", "-ee", str(file_path)]
+           "-GPSLatitude", "-GPSLongitude", "-GPSCoordinates", "-Duration", "-ee", str(file_path)]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode == 0:
@@ -61,23 +70,42 @@ def get_metadata(file_path):
 def parse_base_date(date_str):
     if not date_str: return None
     match = re.search(r"(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})", str(date_str))
-    return match.group(1) if match else None
+    if match:
+        try:
+            # Convert to actual datetime object for math
+            return datetime.strptime(match.group(1), "%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            pass
+    return None
 
 def compare_metadata(meta_src, meta_dst):
     discrepancies = []
 
-    dates_src = {parse_base_date(meta_src.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]}
-    dates_dst = {parse_base_date(meta_dst.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]}
+    # 1. Date Comparison with Tolerance
+    dates_src = [parse_base_date(meta_src.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]]
+    dates_dst = [parse_base_date(meta_dst.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]]
 
-    dates_src.discard(None)
-    dates_dst.discard(None)
+    # Filter out None values
+    dates_src = [d for d in dates_src if d]
+    dates_dst = [d for d in dates_dst if d]
 
     if dates_src:
         if not dates_dst:
             discrepancies.append("Missing Date")
-        elif not dates_src.intersection(dates_dst):
-            discrepancies.append(f"Date Mismatch (Src: {dates_src} vs Dst: {dates_dst})")
+        else:
+            # Look for ANY valid match within the tolerance window
+            match_found = False
+            for d_src in dates_src:
+                for d_dst in dates_dst:
+                    if abs((d_src - d_dst).total_seconds()) <= DATE_TOLERANCE_SECONDS:
+                        match_found = True
+                        break
+                if match_found: break
+            
+            if not match_found:
+                discrepancies.append(f"Date Mismatch (exceeded {DATE_TOLERANCE_SECONDS}s tolerance)")
 
+    # 2. GPS Comparison
     lat_src, lon_src = extract_gps(meta_src)
     lat_dst, lon_dst = extract_gps(meta_dst)
 
@@ -89,6 +117,16 @@ def compare_metadata(meta_src, meta_dst):
                 discrepancies.append("Latitude Mismatch")
             if abs(lon_src - lon_dst) > 0.0001:
                 discrepancies.append("Longitude Mismatch")
+
+    # 3. Duration Comparison (Ensures the file wasn't truncated)
+    dur_src = meta_src.get("Duration")
+    dur_dst = meta_dst.get("Duration")
+    if dur_src is not None and dur_dst is not None:
+        try:
+            if abs(float(dur_src) - float(dur_dst)) > DURATION_TOLERANCE_SECONDS:
+                discrepancies.append("Duration Mismatch (File may be truncated)")
+        except ValueError:
+            pass
 
     if not discrepancies: return True, ""
     return False, " | ".join(discrepancies)
@@ -153,9 +191,9 @@ def main():
                 # Try to re-apply the EXIF fix directly over the file
                 subprocess.run([
                     "exiftool", "-tagsFromFile", str(in_path),
-                    "-all:all",                               
+                    "-all:all",                                
                     "-Orientation<Rotation",                  
-                    "-Orientation<Orientation",               
+                    "-Orientation<Orientation",                
                     "-overwrite_original", str(out_path)
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

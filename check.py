@@ -7,7 +7,10 @@ from pathlib import Path
 # --- Configuration ---
 INPUT_DIR = Path(os.environ.get("INPUT_DIR", "/data/input"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/output"))
-CHECKS = os.environ.get("CHECKS", "all").lower() # all, integrity, metadata, none
+CHECKS = os.environ.get("CHECKS", "all").lower() 
+
+# Added Mode Variable
+MODE = os.environ.get("MODE", "full").lower() # convert, check, full
 
 def check_structural_integrity(file_path):
     cmd = [
@@ -23,20 +26,16 @@ def check_structural_integrity(file_path):
         return False, str(e)
 
 def extract_gps(meta):
-    """Helper to reliably extract Latitude and Longitude into floats from either EXIF or QuickTime."""
     lat, lon = meta.get("GPSLatitude"), meta.get("GPSLongitude")
 
-    # If standard EXIF tags exist (mostly images), use them
     if lat is not None and lon is not None:
         try:
             return float(lat), float(lon)
         except ValueError:
             pass
 
-    # Fallback for Apple QuickTime GPSCoordinates (Lat Lon Alt)
     coords = meta.get("GPSCoordinates")
     if coords:
-        # With exiftool -n, this is space-separated: e.g., "37.33 -122.03 15.4"
         parts = str(coords).split()
         if len(parts) >= 2:
             try:
@@ -47,7 +46,6 @@ def extract_gps(meta):
     return None, None
 
 def get_metadata(file_path):
-    # Added '-CreationDate' to catch Apple's local time tag
     cmd = ["exiftool", "-j", "-n", "-DateTimeOriginal", "-CreationDate", "-CreateDate",
            "-GPSLatitude", "-GPSLongitude", "-GPSCoordinates", "-ee", str(file_path)]
     try:
@@ -61,7 +59,6 @@ def get_metadata(file_path):
         return {}
 
 def parse_base_date(date_str):
-    """Strips timezones and extra formatting to return just YYYY:MM:DD HH:MM:SS"""
     if not date_str: return None
     match = re.search(r"(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})", str(date_str))
     return match.group(1) if match else None
@@ -69,23 +66,18 @@ def parse_base_date(date_str):
 def compare_metadata(meta_src, meta_dst):
     discrepancies = []
 
-    # 1. Smarter Date Check
-    # Grab all possible dates and strip timezones
     dates_src = {parse_base_date(meta_src.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]}
     dates_dst = {parse_base_date(meta_dst.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]}
 
-    # Remove Nones from the sets
     dates_src.discard(None)
     dates_dst.discard(None)
 
     if dates_src:
         if not dates_dst:
             discrepancies.append("Missing Date")
-        # If there is NO overlap between the source dates and destination dates, it's a mismatch
         elif not dates_src.intersection(dates_dst):
             discrepancies.append(f"Date Mismatch (Src: {dates_src} vs Dst: {dates_dst})")
 
-    # 2. GPS Check (using the helper function from the previous fix)
     lat_src, lon_src = extract_gps(meta_src)
     lat_dst, lon_dst = extract_gps(meta_dst)
 
@@ -111,6 +103,10 @@ def get_input_files():
     return input_files
 
 def main():
+    if MODE == "convert":
+        print("--- Integrity Check Skipped (MODE=convert) ---")
+        return
+
     print("--- Starting Integrity Check ---")
 
     if CHECKS == "none":
@@ -142,22 +138,39 @@ def main():
             is_struct_ok, struct_err = check_structural_integrity(out_path)
             if not is_struct_ok:
                 print(f"[FAIL] {out_path.name} -> CORRUPT FILE: {struct_err}")
-                out_path.unlink() # AUTO-DELETE
+                out_path.unlink() 
                 print(f"       -> Deleted corrupted file.")
                 failed += 1
                 file_failed = True
-                continue # Skip to next file
+                continue 
 
-        # 2. Metadata Check
+        # 2. Metadata Check & Fix
         if not file_failed and CHECKS in ["all", "metadata"]:
             is_meta_ok, meta_err = compare_metadata(get_metadata(in_path), get_metadata(out_path))
             if not is_meta_ok:
-                print(f"[FAIL] {out_path.name} -> METADATA ERROR: {meta_err}")
-                out_path.unlink() # AUTO-DELETE
-                print(f"       -> Deleted file due to metadata mismatch.")
-                failed += 1
-                file_failed = True
-                continue # Skip to next file
+                print(f"[WARN] {out_path.name} -> METADATA ERROR: {meta_err}. Attempting fix...")
+                
+                # Try to re-apply the EXIF fix directly over the file
+                subprocess.run([
+                    "exiftool", "-tagsFromFile", str(in_path),
+                    "-all:all",                               
+                    "-Orientation<Rotation",                  
+                    "-Orientation<Orientation",               
+                    "-overwrite_original", str(out_path)
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                # Re-verify after fix
+                is_meta_ok_retry, meta_err_retry = compare_metadata(get_metadata(in_path), get_metadata(out_path))
+                
+                if not is_meta_ok_retry:
+                    print(f"[FAIL] {out_path.name} -> FIX FAILED: {meta_err_retry}")
+                    out_path.unlink() 
+                    print(f"       -> Deleted file due to unrecoverable metadata.")
+                    failed += 1
+                    file_failed = True
+                    continue
+                else:
+                    print(f"       -> Metadata restored successfully!")
 
         if not file_failed:
             print(f"[OK] {out_path.name} -> Verified")

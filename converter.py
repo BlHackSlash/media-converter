@@ -237,7 +237,7 @@ def main():
     count = 0
 
     # Execute processing using ProcessPoolExecutor with JOBS variable
-    with concurrent.futures.ProcessPoolExecutor(max_workers=JOBS) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JOBS) as executor:
         future_to_file = {executor.submit(process_single_file, fp): fp for fp in files_to_process}
 
         for future in concurrent.futures.as_completed(future_to_file):

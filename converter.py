@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import time
+import concurrent.futures
 from pathlib import Path
 
 # --- Configuration ---
@@ -13,6 +14,10 @@ DEVICE_PATH = f"/dev/dri/{RENDER_DEVICE}"
 
 # Added Mode Variable
 MODE = os.environ.get("MODE", "full").lower() # convert, check, full
+
+# Explicit Multi-threading Configuration
+JOBS = int(os.environ.get("JOBS", "4"))       # Number of files processed simultaneously
+THREADS = str(os.environ.get("THREADS", "2")) # CPU threads allocated per encoder instance
 
 # Quality Defaults Updated
 VIDEO_QUALITY = os.environ.get("VIDEO_QUALITY", "28")
@@ -65,14 +70,14 @@ def get_compatible_image_input(input_path, temp_path):
 # --- Processing Functions ---
 def process_video_hevc_gpu(input_path, output_file):
     cmd = [
-        "ffmpeg", "-y", "-vaapi_device", DEVICE_PATH, "-i", str(input_path),
+        "ffmpeg", "-y", "-threads", THREADS, "-vaapi_device", DEVICE_PATH, "-i", str(input_path),
         "-map", "0:v:0", "-map", "0:a?",              
-        "-map_metadata", "0",                         
-        "-map_metadata:s:v", "0:s:v",                 
-        "-map_chapters", "0",                         
+        "-map_metadata", "0",                          
+        "-map_metadata:s:v", "0:s:v",                  
+        "-map_chapters", "0",                          
         "-vf", "format=nv12,hwupload",                
         "-c:v", "hevc_vaapi", "-qp", VIDEO_QUALITY,
-        "-metadata:s:v:0", "rotate=",                 
+        "-metadata:s:v:0", "rotate=",                  
         "-c:a", "aac", "-b:a", "192k",
         "-movflags", "+faststart",                    
         "-movflags", "+use_metadata_tags",
@@ -82,7 +87,7 @@ def process_video_hevc_gpu(input_path, output_file):
 
 def process_video_av1_gpu(input_path, output_file):
     cmd = [
-        "ffmpeg", "-y", "-vaapi_device", DEVICE_PATH, "-i", str(input_path),
+        "ffmpeg", "-y", "-threads", THREADS, "-vaapi_device", DEVICE_PATH, "-i", str(input_path),
         "-map", "0:v:0", "-map", "0:a?",
         "-map_metadata", "0",
         "-map_metadata:s:v", "0:s:v",
@@ -100,7 +105,7 @@ def process_video_av1_gpu(input_path, output_file):
 def process_video_hevc_cpu(input_path, output_file):
     preset = get_default_preset("hevc")
     cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
+        "ffmpeg", "-y", "-threads", THREADS, "-i", str(input_path),
         "-map", "0:v:0", "-map", "0:a?",
         "-map_metadata", "0",
         "-map_metadata:s:v", "0:s:v",
@@ -117,7 +122,7 @@ def process_video_hevc_cpu(input_path, output_file):
 def process_video_av1_cpu(input_path, output_file):
     preset = get_default_preset("av1")
     cmd = [
-        "ffmpeg", "-y", "-i", str(input_path),
+        "ffmpeg", "-y", "-threads", THREADS, "-i", str(input_path),
         "-map", "0:v:0", "-map", "0:a?",
         "-map_metadata", "0",
         "-map_metadata:s:v", "0:s:v",
@@ -150,11 +155,71 @@ def process_image_avif(input_path, output_file):
     safe_input = get_compatible_image_input(input_path, temp_png)
 
     qp_max = 63 - int((IMAGE_QUALITY * 63) / 100)
-    cmd = ["avifenc", "--min", "0", "--max", str(qp_max), "--speed", IMAGE_SPEED, "--jobs", str(os.cpu_count()), str(safe_input), str(output_file)]
+
+    # Use the explicit THREADS variable instead of dynamically calculating
+    cmd = ["avifenc", "--min", "0", "--max", str(qp_max), "--speed", IMAGE_SPEED, "--jobs", THREADS, str(safe_input), str(output_file)]
     res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     if temp_png.exists(): temp_png.unlink()
     return res
+
+def process_single_file(input_path):
+    """Worker function for processing a single file"""
+    try:
+        rel_dir = input_path.parent.relative_to(INPUT_DIR)
+        target_dir = OUTPUT_DIR / rel_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        ftype = check_file_type(input_path)
+
+        output_file = target_dir / (f"{input_path.stem}.{VIDEO_CONTAINER if ftype == 'VIDEO' else IMAGE_FORMAT}")
+
+        if not FORCE_OVERWRITE and output_file.exists() and output_file.stat().st_size > 0:
+            return {"status": "SKIP", "file": input_path.name, "orig_size": 0, "new_size": 0, "msg": ""}
+
+        start = time.time()
+        if ftype == "VIDEO":
+            if HW_ACCEL:
+                res = process_video_av1_gpu(input_path, output_file) if VIDEO_CODEC == "av1" else process_video_hevc_gpu(input_path, output_file)
+            else:
+                res = process_video_av1_cpu(input_path, output_file) if VIDEO_CODEC == "av1" else process_video_hevc_cpu(input_path, output_file)
+        else:
+            res = process_image_avif(input_path, output_file) if IMAGE_FORMAT == "avif" else process_image_heic(input_path, output_file)
+        
+        if res.returncode == 0 and input_path.suffix.lower() not in [".heic", ".avif"]:
+            subprocess.run([
+                "exiftool", "-tagsFromFile", str(input_path),
+                "-all:all",                               
+                "-Orientation<Rotation",                  
+                "-Orientation<Orientation",               
+                "-overwrite_original", str(output_file)
+            ], stdout=subprocess.DEVNULL)
+
+        elapsed = time.time() - start
+
+        if res.returncode == 0:
+            orig_size = input_path.stat().st_size
+            new_size = output_file.stat().st_size if output_file.exists() else 0
+
+            should_limit = False
+            if LIMIT_SIZE == "always": should_limit = True
+            elif LIMIT_SIZE == "videos" and ftype == "VIDEO": should_limit = True
+            elif LIMIT_SIZE == "images" and ftype == "IMAGE": should_limit = True
+
+            if should_limit and new_size > orig_size and input_path.suffix.lower() not in [".heic", ".avif"]:
+                output_file.unlink()
+                copy_with_meta(input_path, output_file)
+                new_size = orig_size
+                msg = f"(Grew from {orig_size/(1024*1024):.1f}MB to {new_size/(1024*1024):.1f}MB). Keeping original."
+                return {"status": "REVERT", "file": input_path.name, "orig_size": orig_size, "new_size": new_size, "msg": msg}
+            else:
+                msg = f"({orig_size/(1024*1024):.1f}MB -> {new_size/(1024*1024):.1f}MB) in {elapsed:.1f}s"
+                return {"status": "OK", "file": input_path.name, "orig_size": orig_size, "new_size": new_size, "msg": msg}
+        else:
+            err = res.stderr.decode('utf-8', errors='ignore')[-250:].replace('\n', ' ')
+            return {"status": "FAIL", "file": input_path.name, "orig_size": 0, "new_size": 0, "msg": err}
+
+    except Exception as e:
+        return {"status": "ERROR", "file": input_path.name, "orig_size": 0, "new_size": 0, "msg": str(e)}
 
 def main():
     if MODE == "check":
@@ -162,70 +227,37 @@ def main():
         return
 
     check_dependencies()
-    print(f"--- Media Converter Started ---")
+    print(f"--- Media Converter Started ({JOBS} Concurrent Jobs | {THREADS} Threads per Job) ---")
     files_to_process = [Path(root) / f for root, dirs, files in os.walk(INPUT_DIR) for f in files if check_file_type(Path(root) / f)]
-    print(f"Found {len(files_to_process)} media files. Processing...")
+    total_files = len(files_to_process)
+    print(f"Found {total_files} media files. Processing...")
 
     total_orig_size = 0
     total_new_size = 0
     count = 0
-    for input_path in files_to_process:
-        count += 1
-        try:
-            rel_dir = input_path.parent.relative_to(INPUT_DIR)
-            target_dir = OUTPUT_DIR / rel_dir
-            target_dir.mkdir(parents=True, exist_ok=True)
-            ftype = check_file_type(input_path)
 
-            output_file = target_dir / (f"{input_path.stem}.{VIDEO_CONTAINER if ftype == 'VIDEO' else IMAGE_FORMAT}")
+    # Execute processing using ProcessPoolExecutor with JOBS variable
+    with concurrent.futures.ProcessPoolExecutor(max_workers=JOBS) as executor:
+        future_to_file = {executor.submit(process_single_file, fp): fp for fp in files_to_process}
 
-            if not FORCE_OVERWRITE and output_file.exists() and output_file.stat().st_size > 0:
-                print(f"[{count}/{len(files_to_process)}] SKIP: {input_path.name}"); continue
+        for future in concurrent.futures.as_completed(future_to_file):
+            count += 1
+            res = future.result()
+            
+            status = res["status"]
+            fname = res["file"]
+            msg = res["msg"]
 
-            start = time.time()
-            if ftype == "VIDEO":
-                if HW_ACCEL:
-                    res = process_video_av1_gpu(input_path, output_file) if VIDEO_CODEC == "av1" else process_video_hevc_gpu(input_path, output_file)
-                else:
-                    res = process_video_av1_cpu(input_path, output_file) if VIDEO_CODEC == "av1" else process_video_hevc_cpu(input_path, output_file)
+            if status in ["OK", "REVERT"]:
+                total_orig_size += res["orig_size"]
+                total_new_size += res["new_size"]
+
+            if status == "SKIP":
+                print(f"[{count}/{total_files}] SKIP: {fname}")
+            elif status in ["OK", "REVERT"]:
+                print(f"[{count}/{total_files}] {status}: {fname} {msg}")
             else:
-                res = process_image_avif(input_path, output_file) if IMAGE_FORMAT == "avif" else process_image_heic(input_path, output_file)
-                
-                if res.returncode == 0 and input_path.suffix.lower() not in [".heic", ".avif"]:
-                    subprocess.run([
-                        "exiftool", "-tagsFromFile", str(input_path),
-                        "-all:all",                               
-                        "-Orientation<Rotation",                  
-                        "-Orientation<Orientation",               
-                        "-overwrite_original", str(output_file)
-                    ], stdout=subprocess.DEVNULL)
-
-            elapsed = time.time() - start
-
-            if res.returncode == 0:
-                orig_size = input_path.stat().st_size
-                new_size = output_file.stat().st_size if output_file.exists() else 0
-
-                should_limit = False
-                if LIMIT_SIZE == "always": should_limit = True
-                elif LIMIT_SIZE == "videos" and ftype == "VIDEO": should_limit = True
-                elif LIMIT_SIZE == "images" and ftype == "IMAGE": should_limit = True
-
-                if should_limit and new_size > orig_size and input_path.suffix.lower() not in [".heic", ".avif"]:
-                    print(f"[{count}/{len(files_to_process)}] REVERT: {input_path.name} (Grew from {orig_size/(1024*1024):.1f}MB to {new_size/(1024*1024):.1f}MB). Keeping original.")
-                    output_file.unlink()
-                    copy_with_meta(input_path, output_file)
-                    new_size = orig_size
-                else:
-                    print(f"[{count}/{len(files_to_process)}] OK: {input_path.name} ({orig_size/(1024*1024):.1f}MB -> {new_size/(1024*1024):.1f}MB) in {elapsed:.1f}s")
-                total_orig_size += orig_size
-                total_new_size += new_size
-            else:
-                err = res.stderr.decode('utf-8', errors='ignore')[-250:].replace('\n', ' ')
-                print(f"[{count}/{len(files_to_process)}] FAIL: {input_path.name} - {err}")
-
-        except Exception as e:
-            print(f"[ERROR] {input_path.name} - {str(e)}")
+                print(f"[{count}/{total_files}] {status}: {fname} - {msg}")
 
     print("\n--- Pipeline Summary ---")
     saved = total_orig_size - total_new_size

@@ -2,6 +2,7 @@ import os
 import subprocess
 import json
 import re
+import concurrent.futures
 from pathlib import Path
 from datetime import datetime
 
@@ -10,10 +11,14 @@ INPUT_DIR = Path(os.environ.get("INPUT_DIR", "/data/input"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/output"))
 CHECKS = os.environ.get("CHECKS", "all").lower() 
 
-# Added Variables for Robustness
+# Added Variables for Robustness & Parallelization
 MODE = os.environ.get("MODE", "full").lower() # convert, check, full
 DATE_TOLERANCE_SECONDS = int(os.environ.get("DATE_TOLERANCE_SECONDS", 86400)) # Default 24h for timezone drift
 DURATION_TOLERANCE_SECONDS = float(os.environ.get("DURATION_TOLERANCE_SECONDS", 5.0)) # 5 second leniency
+
+# Dynamic Threading: Defaults to (CPU cores + 4) up to 32 if not specified
+DEFAULT_WORKERS = min(32, (os.cpu_count() or 1) + 4)
+CHECK_THREADS = int(os.environ.get("CHECK_THREADS", DEFAULT_WORKERS))
 
 def check_structural_integrity(file_path):
     # Check 1: Is the file completely empty?
@@ -140,6 +145,50 @@ def get_input_files():
             input_files[(str(rel_dir), path.stem)] = path
     return input_files
 
+def check_single_file(out_path, in_path):
+    """Worker function for checking a single file."""
+    if not in_path:
+        return {"status": "MISSING", "file": out_path.name, "msg": "No matching input file found."}
+
+    # 1. Structural Check
+    if CHECKS in ["all", "integrity"]:
+        is_struct_ok, struct_err = check_structural_integrity(out_path)
+        if not is_struct_ok:
+            try:
+                out_path.unlink()
+            except FileNotFoundError:
+                pass
+            return {"status": "FAIL", "file": out_path.name, "msg": f"CORRUPT FILE: {struct_err} -> Deleted corrupted file."}
+
+    # 2. Metadata Check & Fix
+    if CHECKS in ["all", "metadata"]:
+        is_meta_ok, meta_err = compare_metadata(get_metadata(in_path), get_metadata(out_path))
+        if not is_meta_ok:
+            msg_prefix = f"METADATA ERROR: {meta_err}. Attempting fix..."
+            
+            # Try to re-apply the EXIF fix directly over the file
+            subprocess.run([
+                "exiftool", "-tagsFromFile", str(in_path),
+                "-all:all",                                
+                "-Orientation<Rotation",                  
+                "-Orientation<Orientation",                
+                "-overwrite_original", str(out_path)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # Re-verify after fix
+            is_meta_ok_retry, meta_err_retry = compare_metadata(get_metadata(in_path), get_metadata(out_path))
+            
+            if not is_meta_ok_retry:
+                try:
+                    out_path.unlink()
+                except FileNotFoundError:
+                    pass
+                return {"status": "FAIL", "file": out_path.name, "msg": f"{msg_prefix} FIX FAILED: {meta_err_retry} -> Deleted file."}
+            else:
+                return {"status": "WARN", "file": out_path.name, "msg": f"{msg_prefix} Metadata restored successfully!"}
+
+    return {"status": "OK", "file": out_path.name, "msg": "Verified"}
+
 def main():
     if MODE == "convert":
         print("--- Integrity Check Skipped (MODE=convert) ---")
@@ -157,62 +206,40 @@ def main():
 
     input_map = get_input_files()
     output_files = [Path(root) / f for root, dirs, files in os.walk(OUTPUT_DIR) for f in files]
+    total_files = len(output_files)
 
-    print(f"Found {len(output_files)} files in output directory to verify...\n")
-    passed = 0; failed = 0
+    print(f"Found {total_files} files in output directory to verify ({CHECK_THREADS} Concurrent Threads)...\n")
+    passed = 0; failed = 0; count = 0
 
-    for out_path in output_files:
-        rel_dir = str(out_path.parent.relative_to(OUTPUT_DIR))
-        in_path = input_map.get((rel_dir, out_path.stem))
+    # Execute checks using ThreadPoolExecutor for concurrent processing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CHECK_THREADS) as executor:
+        # Prepare the file mappings
+        future_to_file = {}
+        for out_path in output_files:
+            rel_dir = str(out_path.parent.relative_to(OUTPUT_DIR))
+            in_path = input_map.get((rel_dir, out_path.stem))
+            future_to_file[executor.submit(check_single_file, out_path, in_path)] = out_path
 
-        if not in_path:
-            print(f"[WARN] No matching input file found for: {out_path.name}")
-            continue
+        # Process results as they complete
+        for future in concurrent.futures.as_completed(future_to_file):
+            count += 1
+            res = future.result()
+            
+            status = res["status"]
+            fname = res["file"]
+            msg = res["msg"]
 
-        file_failed = False
-
-        # 1. Structural Check
-        if CHECKS in ["all", "integrity"]:
-            is_struct_ok, struct_err = check_structural_integrity(out_path)
-            if not is_struct_ok:
-                print(f"[FAIL] {out_path.name} -> CORRUPT FILE: {struct_err}")
-                out_path.unlink() 
-                print(f"       -> Deleted corrupted file.")
+            if status == "OK":
+                print(f"[{count}/{total_files}] [OK] {fname} -> {msg}")
+                passed += 1
+            elif status == "WARN":
+                print(f"[{count}/{total_files}] [WARN] {fname} -> {msg}")
+                passed += 1 # It was fixed, so we consider it passed
+            elif status == "MISSING":
+                print(f"[{count}/{total_files}] [WARN] {fname} -> {msg}")
+            elif status == "FAIL":
+                print(f"[{count}/{total_files}] [FAIL] {fname} -> {msg}")
                 failed += 1
-                file_failed = True
-                continue 
-
-        # 2. Metadata Check & Fix
-        if not file_failed and CHECKS in ["all", "metadata"]:
-            is_meta_ok, meta_err = compare_metadata(get_metadata(in_path), get_metadata(out_path))
-            if not is_meta_ok:
-                print(f"[WARN] {out_path.name} -> METADATA ERROR: {meta_err}. Attempting fix...")
-                
-                # Try to re-apply the EXIF fix directly over the file
-                subprocess.run([
-                    "exiftool", "-tagsFromFile", str(in_path),
-                    "-all:all",                                
-                    "-Orientation<Rotation",                  
-                    "-Orientation<Orientation",                
-                    "-overwrite_original", str(out_path)
-                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-                # Re-verify after fix
-                is_meta_ok_retry, meta_err_retry = compare_metadata(get_metadata(in_path), get_metadata(out_path))
-                
-                if not is_meta_ok_retry:
-                    print(f"[FAIL] {out_path.name} -> FIX FAILED: {meta_err_retry}")
-                    out_path.unlink() 
-                    print(f"       -> Deleted file due to unrecoverable metadata.")
-                    failed += 1
-                    file_failed = True
-                    continue
-                else:
-                    print(f"       -> Metadata restored successfully!")
-
-        if not file_failed:
-            print(f"[OK] {out_path.name} -> Verified")
-            passed += 1
 
     print("\n--- Integrity Check Complete ---")
     print(f"Total Verified: {passed}")

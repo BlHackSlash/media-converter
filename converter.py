@@ -1,245 +1,226 @@
 import os
-import shutil
 import subprocess
-import time
+import json
+import re
 import concurrent.futures
 from pathlib import Path
+from datetime import datetime
 
 # --- Configuration ---
 INPUT_DIR = Path(os.environ.get("INPUT_DIR", "/data/input"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/output"))
-HW_ACCEL = os.environ.get("HW_ACCEL", "true").lower() == "true"
-RENDER_DEVICE = os.environ.get("RENDER_DEVICE", "renderD128")
-DEVICE_PATH = f"/dev/dri/{RENDER_DEVICE}"
+CHECKS = os.environ.get("CHECKS", "all").lower() 
 
-# Added Mode Variable
+# Added Variables for Robustness & Parallelization
 MODE = os.environ.get("MODE", "full").lower() # convert, check, full
+DATE_TOLERANCE_SECONDS = int(os.environ.get("DATE_TOLERANCE_SECONDS", 86400)) # Default 24h for timezone drift
+DURATION_TOLERANCE_SECONDS = float(os.environ.get("DURATION_TOLERANCE_SECONDS", 5.0)) # 5 second leniency
 
-# Explicit Multi-threading Configuration
-JOBS = int(os.environ.get("JOBS", "4"))       # Number of files processed simultaneously
-THREADS = str(os.environ.get("THREADS", "2")) # CPU threads allocated per encoder instance
+# Dynamic Threading: Defaults to (CPU cores + 4) up to 32 if not specified
+DEFAULT_WORKERS = min(32, (os.cpu_count() or 1) + 4)
+CHECK_THREADS = int(os.environ.get("CHECK_THREADS", DEFAULT_WORKERS))
 
-# Quality Defaults Updated
-VIDEO_QUALITY = os.environ.get("VIDEO_QUALITY", "28")
-VIDEO_CODEC = os.environ.get("VIDEO_CODEC", "hevc").lower()
-VIDEO_CONTAINER = os.environ.get("VIDEO_CONTAINER", "mp4").lstrip(".")
-VIDEO_PRESET = os.environ.get("VIDEO_PRESET")
+def check_structural_integrity(file_path):
+    # Check 1: Is the file completely empty?
+    if file_path.stat().st_size == 0:
+        return False, "File is 0 bytes."
 
-IMAGE_FORMAT = os.environ.get("IMAGE_FORMAT", "heic").lower()
-IMAGE_QUALITY = int(os.environ.get("IMAGE_QUALITY", "60"))
-IMAGE_SPEED = os.environ.get("IMAGE_SPEED", "4")
+    # Check 2: FFprobe container scan
+    cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode == 0 and not res.stderr.strip():
+            return True, ""
+        return False, res.stderr.strip().replace('\n', ' ')[:100]
+    except Exception as e:
+        return False, str(e)
 
-# New Features
-FORCE_OVERWRITE = os.environ.get("FORCE_OVERWRITE", "false").lower() == "true"
-LIMIT_SIZE = os.environ.get("LIMIT_SIZE", "always").lower() # always, videos, images, never
+def extract_gps(meta):
+    lat, lon = meta.get("GPSLatitude"), meta.get("GPSLongitude")
 
-EXTENSIONS_VIDEO = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.m2ts', '.mts', '.mpg', '.mpeg'}
-EXTENSIONS_IMAGE = {'.jpg', '.jpeg', '.png', '.heic', '.webp', '.tiff', '.bmp', '.avif'}
+    if lat is not None and lon is not None:
+        try:
+            return float(lat), float(lon)
+        except ValueError:
+            pass
 
-def get_default_preset(codec):
-    if VIDEO_PRESET:
-        return VIDEO_PRESET
-    return "6" if codec == "av1" else "medium"
+    coords = meta.get("GPSCoordinates")
+    if coords:
+        parts = str(coords).split()
+        if len(parts) >= 2:
+            try:
+                return float(parts[0]), float(parts[1])
+            except ValueError:
+                pass
 
-def check_dependencies():
-    tools = ['ffmpeg', 'exiftool']
-    if IMAGE_FORMAT == "avif": tools.append('avifenc')
-    elif IMAGE_FORMAT == "heic": tools.append('heif-enc')
-    for t in tools:
-        if shutil.which(t) is None:
-            print(f"[FATAL] Missing tool: {t}"); exit(1)
+    return None, None
 
-def check_file_type(path):
-    if path.suffix.lower() in EXTENSIONS_VIDEO: return "VIDEO"
-    if path.suffix.lower() in EXTENSIONS_IMAGE: return "IMAGE"
+def get_metadata(file_path):
+    # Added -Duration to track if the converted file was truncated
+    cmd = ["exiftool", "-j", "-n", "-DateTimeOriginal", "-CreationDate", "-CreateDate",
+           "-GPSLatitude", "-GPSLongitude", "-GPSCoordinates", "-Duration", "-ee", str(file_path)]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            data = json.loads(res.stdout)
+            if data and len(data) > 0:
+                return data[0]
+        return {}
+    except Exception:
+        return {}
+
+def parse_base_date(date_str):
+    if not date_str: return None
+    match = re.search(r"(\d{4}:\d{2}:\d{2} \d{2}:\d{2}:\d{2})", str(date_str))
+    if match:
+        try:
+            # Convert to actual datetime object for math
+            return datetime.strptime(match.group(1), "%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            pass
     return None
 
-def copy_with_meta(input_path, output_file):
-    shutil.copy2(input_path, output_file)
-    return subprocess.CompletedProcess(args=[], returncode=0)
+def compare_metadata(meta_src, meta_dst):
+    discrepancies = []
 
-def get_compatible_image_input(input_path, temp_path):
-    valid_native = {'.jpg', '.jpeg', '.png'}
-    if input_path.suffix.lower() in valid_native:
-        return input_path
+    # 1. Date Comparison with Tolerance
+    dates_src = [parse_base_date(meta_src.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]]
+    dates_dst = [parse_base_date(meta_dst.get(k)) for k in ["DateTimeOriginal", "CreationDate", "CreateDate"]]
 
-    cmd = ["ffmpeg", "-y", "-i", str(input_path), "-vframes", "1", str(temp_path)]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    return temp_path
+    # Filter out None values
+    dates_src = [d for d in dates_src if d]
+    dates_dst = [d for d in dates_dst if d]
 
-# --- Processing Functions ---
-def process_video_hevc_gpu(input_path, output_file):
-    cmd = [
-        "ffmpeg", "-y", "-threads", THREADS, "-vaapi_device", DEVICE_PATH, "-i", str(input_path),
-        "-map", "0:v:0", "-map", "0:a?",              
-        "-map_metadata", "0",                          
-        "-map_metadata:s:v", "0:s:v",                  
-        "-map_chapters", "0",                          
-        "-vf", "format=nv12,hwupload",                
-        "-c:v", "hevc_vaapi", "-qp", VIDEO_QUALITY,
-        "-metadata:s:v:0", "rotate=",                  
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",                    
-        "-movflags", "+use_metadata_tags",
-        str(output_file)
-    ]
-    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-def process_video_av1_gpu(input_path, output_file):
-    cmd = [
-        "ffmpeg", "-y", "-threads", THREADS, "-vaapi_device", DEVICE_PATH, "-i", str(input_path),
-        "-map", "0:v:0", "-map", "0:a?",
-        "-map_metadata", "0",
-        "-map_metadata:s:v", "0:s:v",
-        "-map_chapters", "0",
-        "-vf", "format=nv12,hwupload",
-        "-c:v", "av1_vaapi", "-qp", VIDEO_QUALITY,
-        "-metadata:s:v:0", "rotate=",                 
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",
-        "-movflags", "+use_metadata_tags",
-        str(output_file)
-    ]
-    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-def process_video_hevc_cpu(input_path, output_file):
-    preset = get_default_preset("hevc")
-    cmd = [
-        "ffmpeg", "-y", "-threads", THREADS, "-i", str(input_path),
-        "-map", "0:v:0", "-map", "0:a?",
-        "-map_metadata", "0",
-        "-map_metadata:s:v", "0:s:v",
-        "-map_chapters", "0",
-        "-c:v", "libx265", "-crf", VIDEO_QUALITY, "-preset", preset,
-        "-metadata:s:v:0", "rotate=",
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",
-        "-movflags", "+use_metadata_tags",
-        str(output_file)
-    ]
-    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-def process_video_av1_cpu(input_path, output_file):
-    preset = get_default_preset("av1")
-    cmd = [
-        "ffmpeg", "-y", "-threads", THREADS, "-i", str(input_path),
-        "-map", "0:v:0", "-map", "0:a?",
-        "-map_metadata", "0",
-        "-map_metadata:s:v", "0:s:v",
-        "-map_chapters", "0",
-        "-c:v", "libsvtav1", "-crf", VIDEO_QUALITY, "-preset", preset,
-        "-metadata:s:v:0", "rotate=",
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",
-        "-movflags", "+use_metadata_tags",
-        str(output_file)
-    ]
-    return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-def process_image_heic(input_path, output_file):
-    if input_path.suffix.lower() == ".heic": return copy_with_meta(input_path, output_file)
-
-    temp_png = output_file.with_suffix('.temp.png')
-    safe_input = get_compatible_image_input(input_path, temp_png)
-
-    cmd = ["heif-enc", "-q", str(IMAGE_QUALITY), str(safe_input), "-o", str(output_file)]
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-    if temp_png.exists(): temp_png.unlink()
-    return res
-
-def process_image_avif(input_path, output_file):
-    if input_path.suffix.lower() == ".avif": return copy_with_meta(input_path, output_file)
-
-    temp_png = output_file.with_suffix('.temp.png')
-    safe_input = get_compatible_image_input(input_path, temp_png)
-
-    qp_max = 63 - int((IMAGE_QUALITY * 63) / 100)
-
-    # Use the explicit THREADS variable instead of dynamically calculating
-    cmd = ["avifenc", "--min", "0", "--max", str(qp_max), "--speed", IMAGE_SPEED, "--jobs", THREADS, str(safe_input), str(output_file)]
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-    if temp_png.exists(): temp_png.unlink()
-    return res
-
-def process_single_file(input_path):
-    """Worker function for processing a single file"""
-    try:
-        rel_dir = input_path.parent.relative_to(INPUT_DIR)
-        target_dir = OUTPUT_DIR / rel_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        ftype = check_file_type(input_path)
-
-        output_file = target_dir / (f"{input_path.stem}.{VIDEO_CONTAINER if ftype == 'VIDEO' else IMAGE_FORMAT}")
-
-        if not FORCE_OVERWRITE and output_file.exists() and output_file.stat().st_size > 0:
-            return {"status": "SKIP", "file": input_path.name, "orig_size": 0, "new_size": 0, "msg": ""}
-
-        start = time.time()
-        if ftype == "VIDEO":
-            if HW_ACCEL:
-                res = process_video_av1_gpu(input_path, output_file) if VIDEO_CODEC == "av1" else process_video_hevc_gpu(input_path, output_file)
-            else:
-                res = process_video_av1_cpu(input_path, output_file) if VIDEO_CODEC == "av1" else process_video_hevc_cpu(input_path, output_file)
+    if dates_src:
+        if not dates_dst:
+            discrepancies.append("Missing Date")
         else:
-            res = process_image_avif(input_path, output_file) if IMAGE_FORMAT == "avif" else process_image_heic(input_path, output_file)
-        
-        if res.returncode == 0 and input_path.suffix.lower() not in [".heic", ".avif"]:
+            # Look for ANY valid match within the tolerance window
+            match_found = False
+            for d_src in dates_src:
+                for d_dst in dates_dst:
+                    if abs((d_src - d_dst).total_seconds()) <= DATE_TOLERANCE_SECONDS:
+                        match_found = True
+                        break
+                if match_found: break
+            
+            if not match_found:
+                discrepancies.append(f"Date Mismatch (exceeded {DATE_TOLERANCE_SECONDS}s tolerance)")
+
+    # 2. GPS Comparison
+    lat_src, lon_src = extract_gps(meta_src)
+    lat_dst, lon_dst = extract_gps(meta_dst)
+
+    if lat_src is not None and lon_src is not None:
+        if lat_dst is None or lon_dst is None:
+            discrepancies.append("Missing GPS Data")
+        else:
+            if abs(lat_src - lat_dst) > 0.0001:
+                discrepancies.append("Latitude Mismatch")
+            if abs(lon_src - lon_dst) > 0.0001:
+                discrepancies.append("Longitude Mismatch")
+
+    # 3. Duration Comparison (Ensures the file wasn't truncated)
+    dur_src = meta_src.get("Duration")
+    dur_dst = meta_dst.get("Duration")
+    if dur_src is not None and dur_dst is not None:
+        try:
+            if abs(float(dur_src) - float(dur_dst)) > DURATION_TOLERANCE_SECONDS:
+                discrepancies.append("Duration Mismatch (File may be truncated)")
+        except ValueError:
+            pass
+
+    if not discrepancies: return True, ""
+    return False, " | ".join(discrepancies)
+
+def get_input_files():
+    input_files = {}
+    for root, dirs, files in os.walk(INPUT_DIR):
+        for f in files:
+            path = Path(root) / f
+            rel_dir = path.parent.relative_to(INPUT_DIR)
+            input_files[(str(rel_dir), path.stem)] = path
+    return input_files
+
+def check_single_file(out_path, in_path):
+    """Worker function for checking a single file."""
+    if not in_path:
+        return {"status": "MISSING", "file": out_path.name, "msg": "No matching input file found."}
+
+    # 1. Structural Check
+    if CHECKS in ["all", "integrity"]:
+        is_struct_ok, struct_err = check_structural_integrity(out_path)
+        if not is_struct_ok:
+            try:
+                out_path.unlink()
+            except FileNotFoundError:
+                pass
+            return {"status": "FAIL", "file": out_path.name, "msg": f"CORRUPT FILE: {struct_err} -> Deleted corrupted file."}
+
+    # 2. Metadata Check & Fix
+    if CHECKS in ["all", "metadata"]:
+        is_meta_ok, meta_err = compare_metadata(get_metadata(in_path), get_metadata(out_path))
+        if not is_meta_ok:
+            msg_prefix = f"METADATA ERROR: {meta_err}. Attempting fix..."
+            
+            # Try to re-apply the EXIF fix directly over the file
             subprocess.run([
-                "exiftool", "-tagsFromFile", str(input_path),
-                "-all:all",                               
+                "exiftool", "-tagsFromFile", str(in_path),
+                "-all:all",                                
                 "-Orientation<Rotation",                  
-                "-Orientation<Orientation",               
-                "-overwrite_original", str(output_file)
-            ], stdout=subprocess.DEVNULL)
+                "-Orientation<Orientation",                
+                "-overwrite_original", str(out_path)
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        elapsed = time.time() - start
-
-        if res.returncode == 0:
-            orig_size = input_path.stat().st_size
-            new_size = output_file.stat().st_size if output_file.exists() else 0
-
-            should_limit = False
-            if LIMIT_SIZE == "always": should_limit = True
-            elif LIMIT_SIZE == "videos" and ftype == "VIDEO": should_limit = True
-            elif LIMIT_SIZE == "images" and ftype == "IMAGE": should_limit = True
-
-            if should_limit and new_size > orig_size and input_path.suffix.lower() not in [".heic", ".avif"]:
-                output_file.unlink()
-                copy_with_meta(input_path, output_file)
-                new_size = orig_size
-                msg = f"(Grew from {orig_size/(1024*1024):.1f}MB to {new_size/(1024*1024):.1f}MB). Keeping original."
-                return {"status": "REVERT", "file": input_path.name, "orig_size": orig_size, "new_size": new_size, "msg": msg}
+            # Re-verify after fix
+            is_meta_ok_retry, meta_err_retry = compare_metadata(get_metadata(in_path), get_metadata(out_path))
+            
+            if not is_meta_ok_retry:
+                try:
+                    out_path.unlink()
+                except FileNotFoundError:
+                    pass
+                return {"status": "FAIL", "file": out_path.name, "msg": f"{msg_prefix} FIX FAILED: {meta_err_retry} -> Deleted file."}
             else:
-                msg = f"({orig_size/(1024*1024):.1f}MB -> {new_size/(1024*1024):.1f}MB) in {elapsed:.1f}s"
-                return {"status": "OK", "file": input_path.name, "orig_size": orig_size, "new_size": new_size, "msg": msg}
-        else:
-            err = res.stderr.decode('utf-8', errors='ignore')[-250:].replace('\n', ' ')
-            return {"status": "FAIL", "file": input_path.name, "orig_size": 0, "new_size": 0, "msg": err}
+                return {"status": "WARN", "file": out_path.name, "msg": f"{msg_prefix} Metadata restored successfully!"}
 
-    except Exception as e:
-        return {"status": "ERROR", "file": input_path.name, "orig_size": 0, "new_size": 0, "msg": str(e)}
+    return {"status": "OK", "file": out_path.name, "msg": "Verified"}
 
 def main():
-    if MODE == "check":
-        print("--- Media Converter Skipped (MODE=check) ---")
+    if MODE == "convert":
+        print("--- Integrity Check Skipped (MODE=convert) ---")
         return
 
-    check_dependencies()
-    print(f"--- Media Converter Started ({JOBS} Concurrent Jobs | {THREADS} Threads per Job) ---")
-    files_to_process = [Path(root) / f for root, dirs, files in os.walk(INPUT_DIR) for f in files if check_file_type(Path(root) / f)]
-    total_files = len(files_to_process)
-    print(f"Found {total_files} media files. Processing...")
+    print("--- Starting Integrity Check ---")
 
-    total_orig_size = 0
-    total_new_size = 0
-    count = 0
+    if CHECKS == "none":
+        print("Checks disabled by environment variable (CHECKS=none). Exiting gracefully.")
+        return
 
-    # Execute processing using ProcessPoolExecutor with JOBS variable
-    with concurrent.futures.ThreadPoolExecutor(max_workers=JOBS) as executor:
-        future_to_file = {executor.submit(process_single_file, fp): fp for fp in files_to_process}
+    if not OUTPUT_DIR.exists() or not INPUT_DIR.exists():
+        print("[ERROR] Input or Output directory missing.")
+        return
 
+    input_map = get_input_files()
+    output_files = [Path(root) / f for root, dirs, files in os.walk(OUTPUT_DIR) for f in files]
+    total_files = len(output_files)
+
+    print(f"Found {total_files} files in output directory to verify ({CHECK_THREADS} Concurrent Threads)...\n")
+    passed = 0; failed = 0; count = 0
+
+    # Execute checks using ThreadPoolExecutor for concurrent processing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CHECK_THREADS) as executor:
+        # Prepare the file mappings
+        future_to_file = {}
+        for out_path in output_files:
+            rel_dir = str(out_path.parent.relative_to(OUTPUT_DIR))
+            in_path = input_map.get((rel_dir, out_path.stem))
+            future_to_file[executor.submit(check_single_file, out_path, in_path)] = out_path
+
+        # Process results as they complete
         for future in concurrent.futures.as_completed(future_to_file):
             count += 1
             res = future.result()
@@ -248,23 +229,21 @@ def main():
             fname = res["file"]
             msg = res["msg"]
 
-            if status in ["OK", "REVERT"]:
-                total_orig_size += res["orig_size"]
-                total_new_size += res["new_size"]
+            if status == "OK":
+                print(f"[{count}/{total_files}] [OK] {fname} -> {msg}")
+                passed += 1
+            elif status == "WARN":
+                print(f"[{count}/{total_files}] [WARN] {fname} -> {msg}")
+                passed += 1 # It was fixed, so we consider it passed
+            elif status == "MISSING":
+                print(f"[{count}/{total_files}] [WARN] {fname} -> {msg}")
+            elif status == "FAIL":
+                print(f"[{count}/{total_files}] [FAIL] {fname} -> {msg}")
+                failed += 1
 
-            if status == "SKIP":
-                print(f"[{count}/{total_files}] SKIP: {fname}")
-            elif status in ["OK", "REVERT"]:
-                print(f"[{count}/{total_files}] {status}: {fname} {msg}")
-            else:
-                print(f"[{count}/{total_files}] {status}: {fname} - {msg}")
-
-    print("\n--- Pipeline Summary ---")
-    saved = total_orig_size - total_new_size
-    print(f"Original Size: {total_orig_size/(1024*1024*1024):.2f} GB")
-    print(f"Converted Size: {total_new_size/(1024*1024*1024):.2f} GB")
-    print(f"Total Storage Saved: {saved/(1024*1024):.1f} MB ({(saved/total_orig_size*100) if total_orig_size > 0 else 0:.1f}%)")
-    print("--- Done ---")
+    print("\n--- Integrity Check Complete ---")
+    print(f"Total Verified: {passed}")
+    print(f"Total Deleted:  {failed}")
 
 if __name__ == "__main__":
     main()
